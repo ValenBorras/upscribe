@@ -19,7 +19,7 @@ import { toast } from "sonner";
 import type { Notebook } from "@/app/lib/supabase/types";
 
 type UploadInfo = {
-  filePath: string;
+  chunkPaths: string[];
   fileName: string;
   fileSize: number;
   duration: number;
@@ -68,6 +68,7 @@ function NewSummaryContent() {
   // Upload
   const [uploadInfo, setUploadInfo] = useState<UploadInfo | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadMode, setUploadMode] = useState<"video" | "transcript">("video");
   const [isDragging, setIsDragging] = useState(false);
   const [transcriptUploaded, setTranscriptUploaded] = useState(false);
@@ -132,24 +133,83 @@ function NewSummaryContent() {
   const handleUploadVideo = useCallback(
     async (file: File) => {
       setUploading(true);
+      setUploadProgress(0);
       setError("");
 
-      const formData = new FormData();
-      formData.append("file", file);
-
       try {
-        const res = await fetch("/api/upload", { method: "POST", body: formData });
-        const data = await res.json();
+        // Read duration from the browser — no server round-trip, no Railway involvement
+        const duration = await new Promise<number>((resolve, reject) => {
+          const video = document.createElement("video");
+          const url = URL.createObjectURL(file);
+          video.preload = "metadata";
+          video.onloadedmetadata = () => { URL.revokeObjectURL(url); resolve(video.duration); };
+          video.onerror = () => { URL.revokeObjectURL(url); reject(new Error("No se pudo leer el video")); };
+          video.src = url;
+        });
 
-        if (!res.ok) throw new Error(data.error || "Error al subir archivo");
-
-        if (data.duration > MAX_DURATION_SECONDS) {
-          setError(
-            `El video dura más de ${MAX_DURATION_HOURS} horas. El máximo permitido es ${MAX_DURATION_HOURS} horas.`,
-          );
+        if (duration > MAX_DURATION_SECONDS) {
+          setError(`El video dura más de ${MAX_DURATION_HOURS} horas. El máximo permitido es ${MAX_DURATION_HOURS} horas.`);
           setUploading(false);
           return;
         }
+
+        // Split into 40 MB chunks (well under Supabase's 50 MB per-file limit)
+        const CHUNK_SIZE = 40 * 1024 * 1024;
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+        // Get a signed upload URL for each chunk from our server
+        const urlRes = await fetch("/api/get-upload-url", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileName: file.name, chunkCount: totalChunks }),
+        });
+        const urlData = await urlRes.json();
+        if (!urlRes.ok) throw new Error(urlData.error || "Error al preparar subida");
+        const { chunks: chunkUrls } = urlData as { chunks: { path: string; signedUrl: string }[] };
+
+        // Upload each chunk directly to Supabase — Railway never sees the video body
+        let bytesUploaded = 0;
+        const chunkPaths: string[] = [];
+
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, file.size);
+          const blob = file.slice(start, end);
+          const { path, signedUrl } = chunkUrls[i];
+          chunkPaths.push(path);
+
+          const bytesAtChunkStart = bytesUploaded;
+          await new Promise<void>((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.upload.onprogress = (e) => {
+              if (e.lengthComputable)
+                setUploadProgress(Math.round((bytesAtChunkStart + e.loaded) / file.size * 100));
+            };
+            xhr.onload = () => {
+              if (xhr.status >= 200 && xhr.status < 300) {
+                bytesUploaded += end - start;
+                resolve();
+              } else {
+                reject(new Error(`Error subiendo parte ${i + 1}: ${xhr.status}`));
+              }
+            };
+            xhr.onerror = () => reject(new Error(`Error de red en parte ${i + 1}`));
+            xhr.open("PUT", signedUrl);
+            xhr.setRequestHeader("Content-Type", "application/octet-stream");
+            xhr.send(blob);
+          });
+        }
+
+        setUploadProgress(100);
+
+        // Finalize — tiny JSON call, no video body through Railway
+        const finalRes = await fetch("/api/upload", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chunkPaths, fileName: file.name, fileSize: file.size, duration }),
+        });
+        const data = await finalRes.json();
+        if (!finalRes.ok) throw new Error(data.error || "Error al procesar el video");
 
         setUploadInfo(data);
         if (!title) setTitle(file.name.replace(/\.[^.]+$/, ""));
@@ -269,7 +329,7 @@ function NewSummaryContent() {
         const prepRes = await fetch("/api/prepare", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ summaryId: sid, filePath: uploadInfo.filePath }),
+          body: JSON.stringify({ summaryId: sid, chunkPaths: uploadInfo.chunkPaths }),
         });
 
         if (!prepRes.ok) {
@@ -548,7 +608,20 @@ function NewSummaryContent() {
             }`}
           >
             {uploading ? (
-              <Loader2 className="w-8 h-8 animate-spin text-indigo-400 mx-auto mb-3" />
+              <div className="mx-auto mb-3 w-full max-w-xs">
+                <Loader2 className="w-8 h-8 animate-spin text-indigo-400 mx-auto mb-3" />
+                {uploadProgress > 0 && uploadProgress < 100 && (
+                  <>
+                    <div className="w-full bg-white/10 rounded-full h-1.5">
+                      <div
+                        className="bg-indigo-500 h-1.5 rounded-full transition-all"
+                        style={{ width: `${uploadProgress}%` }}
+                      />
+                    </div>
+                    <p className="text-white/40 text-xs mt-2">{uploadProgress}% subido a Supabase...</p>
+                  </>
+                )}
+              </div>
             ) : (
               <Upload className="w-8 h-8 text-white/30 mx-auto mb-3" />
             )}

@@ -1,12 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import path from "path";
 import fs from "fs";
+import { pipeline } from "stream/promises";
+import { Readable } from "stream";
 import { segmentVideo } from "@/app/lib/ffmpeg";
 import { createClient, createServiceClient } from "@/app/lib/supabase/server";
 
 const TEMP_DIR = path.join(process.cwd(), "temp");
+const BUCKET = "videos";
 
 export async function POST(req: NextRequest) {
+  console.log("[prepare] POST received");
   const supabase = await createClient();
   const {
     data: { user },
@@ -17,16 +21,19 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const { filePath, summaryId } = await req.json();
+    const { chunkPaths, summaryId } = await req.json();
 
-    if (!filePath || !summaryId) {
+    if (!Array.isArray(chunkPaths) || chunkPaths.length === 0 || !summaryId) {
       return NextResponse.json({ error: "Faltan parámetros" }, { status: 400 });
     }
 
-    // Validate file path is within temp dir
-    const resolvedPath = path.resolve(filePath);
-    if (!resolvedPath.startsWith(TEMP_DIR) || !fs.existsSync(resolvedPath)) {
-      return NextResponse.json({ error: "Archivo no encontrado" }, { status: 404 });
+    // Validate all chunk paths belong to this user
+    if (
+      !chunkPaths.every(
+        (p: unknown) => typeof p === "string" && p.startsWith(user.id + "/"),
+      )
+    ) {
+      return NextResponse.json({ error: "Paths inválidos" }, { status: 403 });
     }
 
     // Verify summary belongs to this user
@@ -41,15 +48,48 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Resumen no encontrado" }, { status: 404 });
     }
 
-    // Update status
     const serviceClient = createServiceClient();
+
     await serviceClient
       .from("summaries")
       .update({ status: "transcribing" })
       .eq("id", summaryId);
 
-    // Split video into segments — fast because it just copies streams
-    const chunks = await segmentVideo(resolvedPath);
+    // Download all chunks from Supabase Storage and concatenate into one file.
+    // Each chunk is raw bytes (file.slice) so simple concatenation reconstructs
+    // the original file perfectly.
+    const uploadDir = path.join(TEMP_DIR, summaryId);
+    fs.mkdirSync(uploadDir, { recursive: true });
+    const localPath = path.join(uploadDir, "input.mp4");
+
+    for (let i = 0; i < chunkPaths.length; i++) {
+      console.log(`[prepare] downloading chunk ${i + 1}/${chunkPaths.length}`);
+      const { data: signedData, error: signedError } = await serviceClient.storage
+        .from(BUCKET)
+        .createSignedUrl(chunkPaths[i], 600);
+
+      if (signedError || !signedData) {
+        throw new Error(`No signed URL for chunk ${i}: ${signedError?.message}`);
+      }
+
+      const resp = await fetch(signedData.signedUrl);
+      if (!resp.ok || !resp.body) {
+        throw new Error(`Chunk ${i} download failed: ${resp.status}`);
+      }
+
+      // First chunk creates the file; subsequent chunks append
+      await pipeline(
+        Readable.fromWeb(resp.body as Parameters<typeof Readable.fromWeb>[0]),
+        fs.createWriteStream(localPath, { flags: i === 0 ? "w" : "a" }),
+      );
+    }
+
+    console.log("[prepare] all chunks concatenated, deleting from Supabase Storage...");
+    await serviceClient.storage.from(BUCKET).remove(chunkPaths);
+    console.log("[prepare] Storage cleared, running ffmpeg segment...");
+
+    const chunks = await segmentVideo(localPath);
+    console.log("[prepare] segmented into", chunks.length, "chunks");
 
     return NextResponse.json({
       success: true,
@@ -57,10 +97,11 @@ export async function POST(req: NextRequest) {
       totalChunks: chunks.length,
     });
   } catch (error) {
-    console.error("Prepare error:", error);
+    console.error("[prepare] error:", error);
     return NextResponse.json(
       { error: "Error al preparar el video" },
       { status: 500 },
     );
   }
 }
+
