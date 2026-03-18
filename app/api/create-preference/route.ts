@@ -40,6 +40,9 @@ export async function POST(request: Request) {
   const client = createMPClient();
   const preference = new Preference(client);
 
+  const appUrl = process.env.NEXT_PUBLIC_URL ?? "";
+  const isSandbox = process.env.MP_SANDBOX === "true";
+
   const result = await preference.create({
     body: {
       items: [
@@ -53,12 +56,13 @@ export async function POST(request: Request) {
       ],
       payer: { email: user.email ?? "" },
       back_urls: {
-        success: `${process.env.NEXT_PUBLIC_URL}/payment/success`,
-        failure: `${process.env.NEXT_PUBLIC_URL}/payment/failure`,
-        pending: `${process.env.NEXT_PUBLIC_URL}/payment/pending`,
+        success: `${appUrl}/payment/success`,
+        failure: `${appUrl}/payment/failure`,
+        pending: `${appUrl}/payment/pending`,
       },
-      auto_return: "approved",
-      notification_url: `${process.env.NEXT_PUBLIC_URL}/api/webhooks/mercadopago`,
+      // auto_return requires public (non-localhost) back_urls — omit in local dev
+      ...(isSandbox ? {} : { auto_return: "approved" as const }),
+      ...(isSandbox ? {} : { notification_url: `${appUrl}/api/webhooks/mercadopago` }),
       external_reference: summaryId,
       metadata: {
         user_id: user.id,
@@ -78,5 +82,10 @@ export async function POST(request: Request) {
     status: "pending" as const,
   });
 
-  return NextResponse.json({ init_point: result.init_point });
+  // Use sandbox checkout URL for local dev (test accounts only work on sandbox)
+  const checkoutUrl = isSandbox
+    ? (result.sandbox_init_point ?? result.init_point)
+    : result.init_point;
+
+  return NextResponse.json({ init_point: checkoutUrl });
 }

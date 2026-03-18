@@ -18,6 +18,9 @@ export async function POST() {
   const client = createMPClient();
   const preapproval = new PreApproval(client);
 
+  const appUrl = process.env.NEXT_PUBLIC_URL ?? "";
+  const isSandbox = process.env.MP_SANDBOX === "true";
+
   const result = await preapproval.create({
     body: {
       reason: "UP-Scribe Suscripción Mensual",
@@ -27,7 +30,7 @@ export async function POST() {
         transaction_amount: SUBSCRIPTION_PRICE,
         currency_id: "ARS",
       },
-      back_url: `${process.env.NEXT_PUBLIC_URL}/payment/success?type=subscription`,
+      back_url: `${appUrl}/payment/success?type=subscription`,
       payer_email: user.email ?? "",
       external_reference: user.id,
     },
@@ -43,5 +46,11 @@ export async function POST() {
     status: "pending" as const,
   });
 
-  return NextResponse.json({ init_point: result.init_point });
+  // Use sandbox checkout URL for local dev (test accounts only work on sandbox)
+  const resultAny = result as unknown as Record<string, unknown>;
+  const checkoutUrl = isSandbox
+    ? ((resultAny.sandbox_init_point as string | undefined) ?? result.init_point)
+    : result.init_point;
+
+  return NextResponse.json({ init_point: checkoutUrl });
 }
