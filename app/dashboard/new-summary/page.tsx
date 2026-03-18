@@ -71,6 +71,7 @@ function NewSummaryContent() {
   const [uploadMode, setUploadMode] = useState<"video" | "transcript">("video");
   const [isDragging, setIsDragging] = useState(false);
   const [transcriptUploaded, setTranscriptUploaded] = useState(false);
+  const [transcriptContent, setTranscriptContent] = useState<string>("");
 
   // Processing
   const [summaryId, setSummaryId] = useState<string>("");
@@ -177,6 +178,7 @@ function NewSummaryContent() {
         if (!res.ok) throw new Error(data.error || "Error al subir transcripción");
 
         setTranscriptUploaded(true);
+        setTranscriptContent(data.transcriptContent ?? "");
         if (!title) setTitle(file.name.replace(/\.[^.]+$/, ""));
       } catch (err) {
         setError(err instanceof Error ? err.message : "Upload failed");
@@ -240,6 +242,14 @@ function NewSummaryContent() {
         return;
       }
 
+      // If transcript was uploaded, save it to the summary record
+      if (transcriptContent) {
+        await supabase
+          .from("summaries")
+          .update({ transcript_text: transcriptContent })
+          .eq("id", summary.id);
+      }
+
       // Subscribed user: process directly
       await runProcessing(summary.id);
     } catch (err) {
@@ -255,18 +265,15 @@ function NewSummaryContent() {
       if (uploadInfo) {
         setProgress({ progress: 0, status: "Transcribiendo audio..." });
 
-        const processRes = await fetch("/api/process", {
+        // Fire the processing request without awaiting it —
+        // it runs server-side for minutes; we track via polling.
+        const processPromise = fetch("/api/process", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ summaryId: sid, filePath: uploadInfo.filePath }),
         });
 
-        if (!processRes.ok) {
-          const data = await processRes.json();
-          throw new Error(data.error || "Error al procesar");
-        }
-
-        // Poll progress
+        // Start polling progress immediately
         await new Promise<void>((resolve, reject) => {
           pollingRef.current = setInterval(async () => {
             try {
@@ -287,6 +294,13 @@ function NewSummaryContent() {
             }
           }, 1500);
         });
+
+        // Check if the server request itself failed
+        const processRes = await processPromise;
+        if (!processRes.ok) {
+          const data = await processRes.json();
+          throw new Error(data.error || "Error al procesar");
+        }
       }
 
       // Step 2: Summarize

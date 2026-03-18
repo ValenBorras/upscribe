@@ -1,11 +1,51 @@
 import { NextResponse } from "next/server";
+import crypto from "crypto";
 import { Payment } from "mercadopago";
 import { createMPClient } from "@/app/lib/mercadopago";
 import { createServiceClient } from "@/app/lib/supabase/server";
 
+function verifySignature(request: Request, rawBody: string): boolean {
+  const secret = process.env.MP_WEBHOOK_SECRET;
+  if (!secret) return true; // skip if not configured yet
+
+  const xSignature = request.headers.get("x-signature");
+  const xRequestId = request.headers.get("x-request-id");
+  if (!xSignature || !xRequestId) return false;
+
+  // Parse ts and v1 from x-signature header
+  const parts = Object.fromEntries(
+    xSignature.split(",").map((p) => {
+      const [k, ...v] = p.trim().split("=");
+      return [k, v.join("=")];
+    }),
+  );
+  const ts = parts["ts"];
+  const v1 = parts["v1"];
+  if (!ts || !v1) return false;
+
+  // Extract data.id from body
+  const body = JSON.parse(rawBody);
+  const dataId = body?.data?.id;
+
+  // Build the manifest string per MP docs
+  const manifest = `id:${dataId};request-id:${xRequestId};ts:${ts};`;
+  const hmac = crypto
+    .createHmac("sha256", secret)
+    .update(manifest)
+    .digest("hex");
+
+  return hmac === v1;
+}
+
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
+    const rawBody = await request.text();
+
+    if (!verifySignature(request, rawBody)) {
+      return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
+    }
+
+    const body = JSON.parse(rawBody);
     const { type, data } = body;
 
     const serviceClient = createServiceClient();
