@@ -263,48 +263,73 @@ function NewSummaryContent() {
     try {
       // Step 1: Transcribe (if video was uploaded)
       if (uploadInfo) {
-        setProgress({ progress: 0, status: "Transcribiendo audio..." });
+        // 1a. Prepare — segments video in seconds (stream copy, no re-encoding)
+        setProgress({ progress: 2, status: "Preparando video..." });
 
-        // Fire the processing request without awaiting it —
-        // it runs server-side for minutes; we track via polling.
-        const processPromise = fetch("/api/process", {
+        const prepRes = await fetch("/api/prepare", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ summaryId: sid, filePath: uploadInfo.filePath }),
         });
 
-        // Start polling progress immediately
-        await new Promise<void>((resolve, reject) => {
-          pollingRef.current = setInterval(async () => {
-            try {
-              const progRes = await fetch(`/api/progress?summaryId=${sid}`);
-              const progData = await progRes.json();
-              setProgress(progData);
-
-              if (progData.progress >= 100 || progData.status === "complete") {
-                if (pollingRef.current) clearInterval(pollingRef.current);
-                resolve();
-              }
-              if (progData.status === "error") {
-                if (pollingRef.current) clearInterval(pollingRef.current);
-                reject(new Error("Error durante la transcripción"));
-              }
-            } catch {
-              // polling error, continue
-            }
-          }, 1500);
-        });
-
-        // Check if the server request itself failed
-        const processRes = await processPromise;
-        if (!processRes.ok) {
-          const data = await processRes.json();
-          throw new Error(data.error || "Error al procesar");
+        if (!prepRes.ok) {
+          const d = await prepRes.json();
+          throw new Error(d.error || "Error al preparar el video");
         }
+
+        const { chunks, totalChunks } = await prepRes.json();
+
+        // 1b. Transcribe each chunk individually — each call is ~60s, well within timeout
+        const transcriptParts: string[] = new Array(totalChunks);
+
+        for (let i = 0; i < totalChunks; i++) {
+          setProgress({
+            progress: 5 + Math.round((i / totalChunks) * 90),
+            status: `Transcribiendo parte ${i + 1} de ${totalChunks}...`,
+          });
+
+          let attempts = 0;
+          while (attempts < 3) {
+            try {
+              const chunkRes = await fetch("/api/transcribe-chunk", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  chunkPath: chunks[i],
+                  chunkIndex: i,
+                  totalChunks,
+                  summaryId: sid,
+                }),
+              });
+
+              if (!chunkRes.ok) {
+                const d = await chunkRes.json();
+                throw new Error(d.error || "Error al transcribir");
+              }
+
+              const { text } = await chunkRes.json();
+              transcriptParts[i] = text;
+              break;
+            } catch (err) {
+              attempts++;
+              if (attempts >= 3) throw err;
+              // Wait 2s before retry
+              await new Promise((r) => setTimeout(r, 2000));
+            }
+          }
+        }
+
+        // 1c. Save assembled transcript to DB
+        setProgress({ progress: 96, status: "Guardando transcripción..." });
+        const fullTranscript = transcriptParts.join("\n\n").trim();
+        await supabase
+          .from("summaries")
+          .update({ transcript_text: fullTranscript })
+          .eq("id", sid);
       }
 
       // Step 2: Summarize
-      setProgress({ progress: 0, status: "Generando resumen..." });
+      setProgress({ progress: 98, status: "Generando resumen con IA..." });
 
       const sumRes = await fetch("/api/summarize", {
         method: "POST",
